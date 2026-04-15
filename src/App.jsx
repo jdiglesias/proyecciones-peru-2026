@@ -1,176 +1,124 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
-
-const HEADERS = {
-  Accept: 'application/json, text/plain, */*',
-  'X-Requested-With': 'XMLHttpRequest',
-}
-
-function fetchCandidatos(ubigeo) {
-  return fetch(
-    `/api/presentacion-backend/eleccion-presidencial/participantes-ubicacion-geografica-nombre?tipoFiltro=ubigeo_nivel_01&idAmbitoGeografico=1&ubigeoNivel1=${ubigeo}&listDistrito=&listContinentals=&listCountries=&idEleccion=10`,
-    { headers: HEADERS },
-  ).then((r) => r.json())
-}
-
-function fetchTotales(ubigeo) {
-  return fetch(
-    `/api/presentacion-backend/resumen-general/totales?idAmbitoGeografico=1&idEleccion=10&tipoFiltro=ubigeo_nivel_01&idUbigeoDepartamento=${ubigeo}`,
-    { headers: HEADERS },
-  ).then((r) => r.json())
-}
-
-function fetchExtranjerosCandidatos() {
-  return fetch(
-    `/api/presentacion-backend/eleccion-presidencial/participantes-ubicacion-geografica-nombre?tipoFiltro=ambito_geografico&idAmbitoGeografico=2&listDepartamento=&listProvincia=&listDistrito=&listCountries=&idEleccion=10`,
-    { headers: HEADERS },
-  ).then((r) => r.json())
-}
-
-function fetchExtranjerosTotales() {
-  return fetch(
-    `/api/presentacion-backend/resumen-general/totales?idAmbitoGeografico=2&idEleccion=10&tipoFiltro=ambito_geografico`,
-    { headers: HEADERS },
-  ).then((r) => r.json())
-}
-
-function computeProyeccion(candidatos, totales) {
-  const estimatedTotal =
-    totales.actasContabilizadas > 0
-      ? totales.totalVotosValidos / (totales.actasContabilizadas / 100)
-      : null
-
-  return { candidatos, totales, estimatedTotal }
-}
-
-const VOTOS_ESPECIALES = ['80', '81'] // blancos y nulos
-
-function agregaTodo(resultadosPorDepto) {
-  const byCode = {}
-
-  for (const { candidatos, estimatedTotal } of resultadosPorDepto) {
-    for (const c of candidatos.filter(
-      (c) => !VOTOS_ESPECIALES.includes(c.codigoAgrupacionPolitica),
-    )) {
-      if (!byCode[c.codigoAgrupacionPolitica]) {
-        byCode[c.codigoAgrupacionPolitica] = {
-          codigoAgrupacionPolitica: c.codigoAgrupacionPolitica,
-          nombreAgrupacionPolitica: c.nombreAgrupacionPolitica,
-          nombreCandidato: c.nombreCandidato,
-          totalVotosValidos: 0,
-          proyeccionSum: 0,
-        }
-      }
-      const entry = byCode[c.codigoAgrupacionPolitica]
-      entry.totalVotosValidos += c.totalVotosValidos
-
-      if (estimatedTotal != null && c.porcentajeVotosValidos != null) {
-        entry.proyeccionSum += (c.porcentajeVotosValidos / 100) * estimatedTotal
-      }
-    }
-  }
-
-  const rows = Object.values(byCode)
-  const totalVotos = rows.reduce((s, x) => s + x.totalVotosValidos, 0)
-  const totalProyeccion = rows.reduce((s, r) => s + r.proyeccionSum, 0)
-
-  return rows
-    .map((r) => ({
-      ...r,
-      porcentajeVotosValidos: totalVotos > 0 ? (r.totalVotosValidos / totalVotos) * 100 : null,
-      proyeccion: Math.round(r.proyeccionSum),
-      porcentajeProyeccion: totalProyeccion > 0 ? (r.proyeccionSum / totalProyeccion) * 100 : null,
-    }))
-    .sort((a, b) => b.proyeccion - a.proyeccion)
-}
-
-function fetchRegion(ubigeo) {
-  if (ubigeo === 'EXTRANJEROS') {
-    return Promise.all([fetchExtranjerosCandidatos(), fetchExtranjerosTotales()])
-  }
-  return Promise.all([fetchCandidatos(ubigeo), fetchTotales(ubigeo)])
-}
 
 function toTitleCase(str) {
   return str.toLowerCase().split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
 }
 
+function proyectar(candidatos, totales) {
+  if (!totales || totales.pctActas <= 0) return candidatos.map((c) => ({ ...c, proyeccion: null, pctProyeccion: null }))
+  const estimatedTotal = totales.votosValidos / (totales.pctActas / 100)
+  return candidatos
+    .map((c) => ({
+      ...c,
+      proyeccion: c.pct != null ? Math.round((c.pct / 100) * estimatedTotal) : null,
+    }))
+    .sort((a, b) => (b.proyeccion ?? 0) - (a.proyeccion ?? 0))
+}
+
+function agregarFuentes(fuentes) {
+  // fuentes: array of { candidatos, totales }
+  const byCode = {}
+  for (const { candidatos, totales } of fuentes) {
+    if (!totales || totales.pctActas <= 0) continue
+    const estimatedTotal = totales.votosValidos / (totales.pctActas / 100)
+    for (const c of candidatos) {
+      if (!byCode[c.codigo]) byCode[c.codigo] = { ...c, votos: 0, proyeccionSum: 0 }
+      byCode[c.codigo].votos += c.votos
+      if (c.pct != null) byCode[c.codigo].proyeccionSum += (c.pct / 100) * estimatedTotal
+    }
+  }
+  const rows = Object.values(byCode)
+  const totalVotos = rows.reduce((s, r) => s + r.votos, 0)
+  const totalProy = rows.reduce((s, r) => s + r.proyeccionSum, 0)
+  return rows
+    .map((r) => ({
+      ...r,
+      pct: totalVotos > 0 ? (r.votos / totalVotos) * 100 : null,
+      proyeccion: Math.round(r.proyeccionSum),
+      pctProyeccion: totalProy > 0 ? (r.proyeccionSum / totalProy) * 100 : null,
+    }))
+    .sort((a, b) => b.proyeccion - a.proyeccion)
+}
+
 function App() {
-  const [departamentos, setDepartamentos] = useState([])
-  const [view, setView] = useState('totales') // 'totales' | 'region'
-  const [ubigeo, setUbigeo] = useState('140000')
-  const [candidatos, setCandidatos] = useState([])
-  const [totales, setTotales] = useState(null)
-  const [loading, setLoading] = useState(false)
+  const [data, setData] = useState(null)
+  const [view, setView] = useState('totales')
+  const [deptoKey, setDeptoKey] = useState('140000')
+  const [provKey, setProvKey] = useState(null)
+  const [distKey, setDistKey] = useState(null)
 
   useEffect(() => {
-    fetch(
-      '/api/presentacion-backend/ubigeos/departamentos?idEleccion=10&idAmbitoGeografico=1',
-      { headers: HEADERS },
-    )
-      .then((res) => res.json())
-      .then((json) => setDepartamentos(json.data))
-      .catch(console.error)
+    fetch('/data.json').then((r) => r.json()).then(setData).catch(console.error)
   }, [])
 
-  useEffect(() => {
-    setCandidatos([])
-    setTotales(null)
-    setLoading(true)
+  // Reset deeper selections when parent changes
+  function selectDepto(k) { setDeptoKey(k); setProvKey(null); setDistKey(null) }
+  function selectProv(k) { setProvKey(k); setDistKey(null) }
+
+  const deptos = useMemo(() => {
+    if (!data) return []
+    return Object.entries(data.departamentos).map(([k, v]) => ({ key: k, nombre: v.nombre }))
+  }, [data])
+
+  const provs = useMemo(() => {
+    if (!data || deptoKey === 'EXTRANJEROS') return []
+    const depto = data.departamentos[deptoKey]
+    if (!depto) return []
+    return Object.entries(depto.provincias).map(([k, v]) => ({ key: k, nombre: v.nombre }))
+  }, [data, deptoKey])
+
+  const dists = useMemo(() => {
+    if (!data || !provKey || deptoKey === 'EXTRANJEROS') return []
+    const prov = data.departamentos[deptoKey]?.provincias[provKey]
+    if (!prov) return []
+    return Object.entries(prov.distritos).map(([k, v]) => ({ key: k, nombre: v.nombre }))
+  }, [data, deptoKey, provKey])
+
+  const { candidatos, totales, showPctProy } = useMemo(() => {
+    if (!data) return { candidatos: [], totales: null, showPctProy: false }
 
     if (view === 'totales') {
-      Promise.all([
-        ...departamentos.map((d) =>
-          Promise.all([fetchCandidatos(d.ubigeo), fetchTotales(d.ubigeo)]).then(
-            ([cJson, tJson]) => computeProyeccion(cJson.data, tJson.data),
-          ),
-        ),
-        Promise.all([fetchExtranjerosCandidatos(), fetchExtranjerosTotales()]).then(
-          ([cJson, tJson]) => computeProyeccion(cJson.data, tJson.data),
-        ),
-      ])
-        .then((resultados) => {
-          setCandidatos(agregaTodo(resultados))
-          const totalActas = resultados.reduce(
-            (acc, { totales: t }) => ({
-              contabilizadas: acc.contabilizadas + t.contabilizadas,
-              totalActas: acc.totalActas + t.totalActas,
-            }),
-            { contabilizadas: 0, totalActas: 0 },
-          )
-          setTotales({
-            actasContabilizadas: (totalActas.contabilizadas / totalActas.totalActas) * 100,
-            contabilizadas: totalActas.contabilizadas,
-            totalActas: totalActas.totalActas,
-          })
-        })
-        .catch(console.error)
-        .finally(() => setLoading(false))
-    } else {
-      fetchRegion(ubigeo)
-        .then(([cJson, tJson]) => {
-          const estimatedTotal =
-            tJson.data.actasContabilizadas > 0
-              ? tJson.data.totalVotosValidos / (tJson.data.actasContabilizadas / 100)
-              : null
-          setCandidatos(
-            cJson.data
-              .filter((c) => !VOTOS_ESPECIALES.includes(c.codigoAgrupacionPolitica))
-              .map((c) => ({
-                ...c,
-                proyeccion:
-                  estimatedTotal != null && c.porcentajeVotosValidos != null
-                    ? Math.round((c.porcentajeVotosValidos / 100) * estimatedTotal)
-                    : null,
-                porcentajeProyeccion: c.porcentajeVotosValidos,
-              })),
-          )
-          setTotales(tJson.data)
-        })
-        .catch(console.error)
-        .finally(() => setLoading(false))
+      const fuentes = [
+        ...Object.values(data.departamentos),
+        data.extranjeros,
+      ]
+      const totalActas = fuentes.reduce((acc, f) => ({
+        contabilizadas: acc.contabilizadas + (f.totales?.contabilizadas ?? 0),
+        totalActas: acc.totalActas + (f.totales?.totalActas ?? 0),
+      }), { contabilizadas: 0, totalActas: 0 })
+      return {
+        candidatos: agregarFuentes(fuentes.map((f) => ({ candidatos: f.candidatos, totales: f.totales }))),
+        totales: {
+          pctActas: totalActas.totalActas > 0 ? (totalActas.contabilizadas / totalActas.totalActas) * 100 : 0,
+          contabilizadas: totalActas.contabilizadas,
+          totalActas: totalActas.totalActas,
+        },
+        showPctProy: true,
+      }
     }
-  }, [view, ubigeo, departamentos])
+
+    // Region view
+    let source
+    if (deptoKey === 'EXTRANJEROS') {
+      source = data.extranjeros
+    } else {
+      const depto = data.departamentos[deptoKey]
+      if (provKey) {
+        const prov = depto?.provincias[provKey]
+        source = distKey ? prov?.distritos[distKey] : prov
+      } else {
+        source = depto
+      }
+    }
+
+    if (!source) return { candidatos: [], totales: null, showPctProy: false }
+    return {
+      candidatos: proyectar(source.candidatos, source.totales),
+      totales: source.totales,
+      showPctProy: false,
+    }
+  }, [data, view, deptoKey, provKey, distKey])
 
   return (
     <div>
@@ -190,26 +138,43 @@ function App() {
       </p>
 
       {view === 'region' && (
-        <select value={ubigeo} onChange={(e) => setUbigeo(e.target.value)}>
-          {departamentos.map((d) => (
-            <option key={d.ubigeo} value={d.ubigeo}>
-              {toTitleCase(d.nombre)}
-            </option>
-          ))}
-          <option value="EXTRANJEROS">Extranjeros</option>
-        </select>
+        <div className="selectors">
+          <select value={deptoKey} onChange={(e) => selectDepto(e.target.value)}>
+            {deptos.map((d) => (
+              <option key={d.key} value={d.key}>{toTitleCase(d.nombre)}</option>
+            ))}
+            <option value="EXTRANJEROS">Extranjeros</option>
+          </select>
+
+          {provs.length > 0 && (
+            <select value={provKey ?? ''} onChange={(e) => selectProv(e.target.value || null)}>
+              <option value="">— Departamento completo —</option>
+              {provs.map((p) => (
+                <option key={p.key} value={p.key}>{toTitleCase(p.nombre)}</option>
+              ))}
+            </select>
+          )}
+
+          {dists.length > 0 && (
+            <select value={distKey ?? ''} onChange={(e) => setDistKey(e.target.value || null)}>
+              <option value="">— Provincia completa —</option>
+              {dists.map((d) => (
+                <option key={d.key} value={d.key}>{toTitleCase(d.nombre)}</option>
+              ))}
+            </select>
+          )}
+        </div>
       )}
 
       {totales && (
         <p style={{ marginBottom: '10px' }}>
-          Actas contabilizadas: {totales.actasContabilizadas.toFixed(1)}% ({totales.contabilizadas}{' '}
-          de {totales.totalActas})
+          Actas contabilizadas: {totales.pctActas.toFixed(1)}% ({totales.contabilizadas} de {totales.totalActas})
         </p>
       )}
 
-      {loading && <p>Cargando...</p>}
+      {!data && <p>Cargando...</p>}
 
-      {!loading && candidatos.length > 0 && (
+      {candidatos.length > 0 && (
         <table>
           <thead>
             <tr>
@@ -217,26 +182,18 @@ function App() {
               <th>Votos válidos</th>
               <th>% votos válidos</th>
               <th>Proyección final</th>
-              {view === 'totales' && <th>% proyección</th>}
+              {showPctProy && <th>% proyección</th>}
             </tr>
           </thead>
           <tbody>
             {candidatos.map((c) => (
-              <tr key={c.codigoAgrupacionPolitica}>
-                <td>{toTitleCase(c.nombreCandidato || c.nombreAgrupacionPolitica)}</td>
-                <td>{c.totalVotosValidos.toLocaleString('es-PE')}</td>
-                <td>
-                  {c.porcentajeVotosValidos != null
-                    ? `${c.porcentajeVotosValidos.toFixed(2)}%`
-                    : '—'}
-                </td>
+              <tr key={c.codigo}>
+                <td>{toTitleCase(c.nombre)}</td>
+                <td>{c.votos.toLocaleString('es-PE')}</td>
+                <td>{c.pct != null ? `${c.pct.toFixed(2)}%` : '—'}</td>
                 <td>{c.proyeccion != null ? c.proyeccion.toLocaleString('es-PE') : '—'}</td>
-                {view === 'totales' && (
-                  <td>
-                    {c.porcentajeProyeccion != null
-                      ? `${c.porcentajeProyeccion.toFixed(2)}%`
-                      : '—'}
-                  </td>
+                {showPctProy && (
+                  <td>{c.pctProyeccion != null ? `${c.pctProyeccion.toFixed(2)}%` : '—'}</td>
                 )}
               </tr>
             ))}
