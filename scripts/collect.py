@@ -25,8 +25,12 @@ async def fetch(session, url, sem):
     async with sem:
         for attempt in range(RETRIES):
             try:
-                async with session.get(url, headers=HEADERS) as resp:
-                    data = await resp.json(content_type=None)
+                async with session.get(url, headers=HEADERS, ssl=False) as resp:
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        raise ValueError(f"Non-JSON (HTTP {resp.status}): {text[:300]}")
                     if data.get("success"):
                         return data["data"]
                     raise ValueError(f"API error: {data.get('message')}")
