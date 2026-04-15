@@ -5,40 +5,89 @@ function toTitleCase(str) {
   return str.toLowerCase().split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
 }
 
-function proyectar(candidatos, totales) {
-  if (!totales || totales.pctActas <= 0) return candidatos.map((c) => ({ ...c, proyeccion: null, pctProyeccion: null }))
-  const estimatedTotal = totales.votosValidos / (totales.pctActas / 100)
+// Returns { estimatedTotal, candidatos } for a source, falling back up the chain
+// if the source has no counted actas.
+function resolveContribucion(totales, candidatos, ...fallbacks) {
+  if (totales?.pctActas > 0) {
+    return { estimatedTotal: totales.votosValidos / (totales.pctActas / 100), candidatos }
+  }
+  if (!totales?.totalActas) return null
+  // Source has actas but none counted — estimate from nearest parent with data
+  for (const fb of fallbacks) {
+    if (fb?.totales?.contabilizadas > 0) {
+      const votesPerActa = fb.totales.votosValidos / fb.totales.contabilizadas
+      return { estimatedTotal: totales.totalActas * votesPerActa, candidatos: fb.candidatos }
+    }
+  }
+  return null
+}
+
+function proyectar(source, ...fallbacks) {
+  const contrib = resolveContribucion(source.totales, source.candidatos, ...fallbacks)
+  if (!contrib) return source.candidatos.map((c) => ({ ...c, proyeccion: null }))
+  const { estimatedTotal, candidatos } = contrib
   return candidatos
-    .map((c) => ({
-      ...c,
-      proyeccion: c.pct != null ? Math.round((c.pct / 100) * estimatedTotal) : null,
-    }))
+    .map((c) => ({ ...c, proyeccion: c.pct != null ? Math.round((c.pct / 100) * estimatedTotal) : null }))
     .sort((a, b) => (b.proyeccion ?? 0) - (a.proyeccion ?? 0))
 }
 
-function agregarFuentes(fuentes) {
-  // fuentes: array of { candidatos, totales }
+function buildNacionalData(data) {
   const byCode = {}
-  for (const { candidatos, totales } of fuentes) {
-    if (!totales || totales.pctActas <= 0) continue
-    const estimatedTotal = totales.votosValidos / (totales.pctActas / 100)
-    for (const c of candidatos) {
-      if (!byCode[c.codigo]) byCode[c.codigo] = { ...c, votos: 0, proyeccionSum: 0 }
-      byCode[c.codigo].votos += c.votos
-      if (c.pct != null) byCode[c.codigo].proyeccionSum += (c.pct / 100) * estimatedTotal
+
+  for (const depto of Object.values(data.departamentos)) {
+    for (const prov of Object.values(depto.provincias)) {
+      for (const dist of Object.values(prov.distritos)) {
+        const contrib = resolveContribucion(dist.totales, dist.candidatos, prov, depto)
+        if (!contrib) continue
+        const { estimatedTotal, candidatos } = contrib
+        for (const c of candidatos) {
+          if (!byCode[c.codigo]) byCode[c.codigo] = { ...c, votos: 0, proyeccionSum: 0 }
+          // actual votes only from districts that have reported
+          if (dist.totales?.pctActas > 0) byCode[c.codigo].votos += c.votos
+          if (c.pct != null) byCode[c.codigo].proyeccionSum += (c.pct / 100) * estimatedTotal
+        }
+      }
     }
   }
+
+  // Extranjeros
+  const ext = data.extranjeros
+  const extContrib = resolveContribucion(ext.totales, ext.candidatos)
+  if (extContrib) {
+    for (const c of extContrib.candidatos) {
+      if (!byCode[c.codigo]) byCode[c.codigo] = { ...c, votos: 0, proyeccionSum: 0 }
+      if (ext.totales?.pctActas > 0) byCode[c.codigo].votos += c.votos
+      if (c.pct != null) byCode[c.codigo].proyeccionSum += (c.pct / 100) * extContrib.estimatedTotal
+    }
+  }
+
   const rows = Object.values(byCode)
   const totalVotos = rows.reduce((s, r) => s + r.votos, 0)
   const totalProy = rows.reduce((s, r) => s + r.proyeccionSum, 0)
-  return rows
-    .map((r) => ({
-      ...r,
-      pct: totalVotos > 0 ? (r.votos / totalVotos) * 100 : null,
-      proyeccion: Math.round(r.proyeccionSum),
-      pctProyeccion: totalProy > 0 ? (r.proyeccionSum / totalProy) * 100 : null,
-    }))
-    .sort((a, b) => b.proyeccion - a.proyeccion)
+
+  const actasTotals = Object.values(data.departamentos).reduce(
+    (acc, d) => ({
+      contabilizadas: acc.contabilizadas + (d.totales?.contabilizadas ?? 0),
+      totalActas: acc.totalActas + (d.totales?.totalActas ?? 0),
+    }),
+    { contabilizadas: ext.totales?.contabilizadas ?? 0, totalActas: ext.totales?.totalActas ?? 0 },
+  )
+
+  return {
+    candidatos: rows
+      .map((r) => ({
+        ...r,
+        pct: totalVotos > 0 ? (r.votos / totalVotos) * 100 : null,
+        proyeccion: Math.round(r.proyeccionSum),
+        pctProyeccion: totalProy > 0 ? (r.proyeccionSum / totalProy) * 100 : null,
+      }))
+      .sort((a, b) => b.proyeccion - a.proyeccion),
+    totales: {
+      pctActas: actasTotals.totalActas > 0 ? (actasTotals.contabilizadas / actasTotals.totalActas) * 100 : 0,
+      contabilizadas: actasTotals.contabilizadas,
+      totalActas: actasTotals.totalActas,
+    },
+  }
 }
 
 function App() {
@@ -79,45 +128,28 @@ function App() {
     if (!data) return { candidatos: [], totales: null, showPctProy: false }
 
     if (view === 'totales') {
-      const fuentes = [
-        ...Object.values(data.departamentos),
-        data.extranjeros,
-      ]
-      const totalActas = fuentes.reduce((acc, f) => ({
-        contabilizadas: acc.contabilizadas + (f.totales?.contabilizadas ?? 0),
-        totalActas: acc.totalActas + (f.totales?.totalActas ?? 0),
-      }), { contabilizadas: 0, totalActas: 0 })
-      return {
-        candidatos: agregarFuentes(fuentes.map((f) => ({ candidatos: f.candidatos, totales: f.totales }))),
-        totales: {
-          pctActas: totalActas.totalActas > 0 ? (totalActas.contabilizadas / totalActas.totalActas) * 100 : 0,
-          contabilizadas: totalActas.contabilizadas,
-          totalActas: totalActas.totalActas,
-        },
-        showPctProy: true,
-      }
+      const { candidatos, totales } = buildNacionalData(data)
+      return { candidatos, totales, showPctProy: true }
     }
 
-    // Region view
-    let source
+    // Region view — pass fallbacks up the chain for unstarted sources
     if (deptoKey === 'EXTRANJEROS') {
-      source = data.extranjeros
-    } else {
-      const depto = data.departamentos[deptoKey]
-      if (provKey) {
-        const prov = depto?.provincias[provKey]
-        source = distKey ? prov?.distritos[distKey] : prov
-      } else {
-        source = depto
-      }
+      const source = data.extranjeros
+      return { candidatos: proyectar(source), totales: source.totales, showPctProy: false }
     }
 
-    if (!source) return { candidatos: [], totales: null, showPctProy: false }
-    return {
-      candidatos: proyectar(source.candidatos, source.totales),
-      totales: source.totales,
-      showPctProy: false,
+    const depto = data.departamentos[deptoKey]
+    if (!provKey) {
+      return { candidatos: proyectar(depto), totales: depto.totales, showPctProy: false }
     }
+
+    const prov = depto.provincias[provKey]
+    if (!distKey) {
+      return { candidatos: proyectar(prov, depto), totales: prov.totales, showPctProy: false }
+    }
+
+    const dist = prov.distritos[distKey]
+    return { candidatos: proyectar(dist, prov, depto), totales: dist.totales, showPctProy: false }
   }, [data, view, deptoKey, provKey, distKey])
 
   return (
